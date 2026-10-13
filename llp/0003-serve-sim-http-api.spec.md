@@ -2,10 +2,10 @@
 
 **Type:** Spec
 **Status:** Active
-**Systems:** ServeSim
+**Systems:** ServeSim, HubClient
 **Author:** Gabe Debes
 **Date:** 2026-09-23
-**Revised:** 2026-10-06 (raw HID close-delivery and cleanup contract)
+**Revised:** 2026-10-09 (rotation readback contract)
 **Related:** LLP 0001, LLP 0002
 
 > File paths such as `src/…` are relative to `packages/serve-sim/packages/serve-sim`, unless the text gives a path from the repository root.
@@ -208,6 +208,47 @@ the DevTools bridge come from `GET /devtools`, which returns a
 
 The CDP bridge forwards frames verbatim in both directions. The token
 subprotocol is not forwarded upstream, so the credential stops at serve-sim.
+
+### Rotation readback
+
+The helper HID socket accepts a `0x07` frame carrying `{ orientation }`.
+Successful native delivery does not mean that the foreground app accepted the
+requested interface orientation. For regular devices, config `orientation`
+starts from native screen readback, then retains the last successfully delivered
+request as device framing. A portrait-only app such as Home therefore does not
+turn the frame back. Later native interface-orientation changes, including ones
+from Simulator.app, do not replace that framing; another helper rotation request
+does, or a new session seeds it again from native readback. This also works with
+older native APIs without orientation metadata. Native dimensions, screen routing
+and recording metadata still come from capture readback
+[observed: `src/device-session.ts` case `0x07` and `readScreenFromNative`, `Sources/SimNative/FrameCapture.swift`].
+
+Foldable devices retain native interface-orientation readback because their
+physical framing is controlled separately by the Duo view. That remains true
+when hinge capability discovery completes after an early rotation request
+[observed: `src/device-session.ts` `readScreenFromNative`, `src/client/client.tsx` `rotateDevice`].
+
+The standalone preview and HubClient advance Rotate from requested poses, so
+rapid clicks or an app-declined pose do not repeat the same request. They ignore
+mismatched orientation readback for up to 1,500 ms after the latest request;
+its acknowledgement releases that protection early. Only orientation changes
+update the cursor; HubClient also reconciles a repeated changed readback that it
+deferred during the grace period once protection expires. An unchanged,
+previously reconciled pose does not reset an app-declined request. HubClient
+resets the cursor when the helper or capture session changes. The displayed
+screen remains server-owned
+[observed: `src/client/simulator/rotation-cursor.ts`, `packages/@expo/hub-client/src/rotation-cursor.ts` and `useIosDevice.ts`].
+
+HubClient advances its cursor only after the browser socket's `send` returns.
+Queued Rotate clicks resolve their next pose at delivery, in queue order;
+expired or evicted clicks never advance it. Helpers advertising `inputAdmission`
+must send `0x83` or a valid `0x82` screen config before HubClient sends input.
+A screen config that establishes admission reconciles orientation before queued
+clicks flush, while an older initial config cannot overwrite newer sent poses
+during the grace period.
+Legacy helpers retain send-on-open compatibility. Browser submission does not
+prove native delivery or app acceptance
+[observed: `packages/@expo/hub-client/src/ws-send-queue.ts`, `rotation-cursor.ts` and `useIosDevice.ts`].
 
 ### Raw HID close contract
 
