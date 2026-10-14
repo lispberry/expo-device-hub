@@ -24,12 +24,19 @@ import {
   axFrontmostAsync,
   axTypeKeyboardCharacterAsync,
   type MjpegFrame,
+  type NativeHingeState,
   type NativeScreenInfo,
   type NativeUnsubscribe,
 } from "./native";
 import { isSoftwareKeyboardVisible } from "./ax";
+import { INPUT_PASTEBOARD_LOCK_TIMEOUT_MS, MAX_PASTEBOARD_TEXT_BYTES, PasteboardBusyError, type PasteboardReadResult, withSimPasteboardLock } from "./sim-pasteboard";
+import { isLiftedModifier, KEY_C, KEY_V, simCommandShortcutHidEvents } from "./sim-command-shortcut";
+import { pasteTextIntoSim } from "./sim-pasteboard-paste";
+import { copyFromSim, withCleanupWarning } from "./sim-pasteboard-copy";
+import { EXEC_WS_MAX_MESSAGE_BYTES } from "./socket/control-utils";
 import { debugKeyboard } from "./debug";
 import { isHingeAngle, type HingeAngleResult } from "./hinge-angle";
+import { readSavedHingeState, writeSavedHingeState } from "./hinge-saved-state";
 import { validatePanelRoute } from "./panel-route";
 import { isHingeControlCommand, hingeControlState, hingePoseOrientation, isTableModeAvailable, type HingeControlCommand, type HingePose, type HingePhysicalOrientation } from "./hinge-control";
 import { getUiOption, refreshDeviceOptionState, setUiOption, setUiOptionIfRevision } from "./ui-settings";
@@ -67,6 +74,8 @@ export interface HidSocket {
 }
 
 type InputOperation = {
+  sequence: number;
+  priorityCleanup?: boolean;
   run: () => Promise<void>;
   resolve: () => void;
   reject: (error: unknown) => void;
@@ -255,6 +264,8 @@ export class DeviceSession {
   private tableMode?: boolean;
   private hingePhysicalOrientation?: HingePhysicalOrientation;
   private hingeControlUpdate: Promise<void> = Promise.resolve();
+  private hingeControlled = false;
+  private hingeRotated = false;
   private nativeScreen?: NativeScreenInfo;
   private screenRefresh?: Promise<boolean>;
   private screenRefreshRequested = false;
@@ -269,6 +280,7 @@ export class DeviceSession {
   private readonly cleanedUpHidSockets = new WeakSet<HidSocket>();
   private readonly inFlightHidMessages = new WeakMap<HidSocket, number>();
   private readonly inFlightOrderedMessages = new WeakMap<HidSocket, number>();
+  private readonly pendingOrderedMessages = new WeakMap<HidSocket, Set<Promise<void>>>();
   private touchGestureLog?: TouchGestureLog;
   private readonly transport: StreamPlaybackSettings["transport"];
   private encoderSettings: StreamEncoderSettings;
@@ -278,6 +290,8 @@ export class DeviceSession {
   private softwareKeyboardSyncPending = false;
   private softwareKeyboardPendingVisible: boolean | undefined;
   private readonly inputOperationQueues = new Map<HidSocket, InputOperation[]>();
+  private inputOperationSequence = 0;
+  private readonly clipboardInputBarriers = new Set<number>();
   private readonly scheduledInputSockets = new Set<HidSocket>();
   private readonly inputSocketOrder: HidSocket[] = [];
   private readonly inputStateWaiters = new Set<() => void>();
@@ -303,6 +317,8 @@ export class DeviceSession {
   private readonly axHandledKeyUsages = new WeakMap<HidSocket, Set<number>>();
   private readonly failedInputSockets = new WeakSet<HidSocket>();
   private readonly overloadedHidSockets = new WeakSet<HidSocket>();
+  /** Queue key for input the server sends itself, so it takes turns with viewers' input. */
+  private readonly serverInput: HidSocket = { send() {}, on() {}, close() {} };
   private restoreHardwareKeyboardWhenIdle = false;
   private hardwareKeyboardRevision?: string;
 
@@ -312,6 +328,7 @@ export class DeviceSession {
     this.encoderSettings = streamEncoderSettingsFrom(streamSettings);
     this.hid = new NativeHid(udid);
     this.capture = new NativeCapture(udid, this.encoderSettings);
+    this.activeHidKeyUsages.set(this.serverInput, new Set());
   }
 
   /** Begin capture. Throws if the device isn't booted. Idempotent. */
@@ -337,8 +354,12 @@ export class DeviceSession {
         this.hid.supportsPhysicalOrientation(),
       ]).then(([supportsHingeAngle, supportsPhysicalOrientation]) => {
         if (this.phase !== "running") return;
-        this.supportsHingeAngle = supportsHingeAngle;
         this.supportsPhysicalOrientation = supportsPhysicalOrientation;
+        if (supportsHingeAngle) {
+          this.hydrateHingeState();
+          return;
+        }
+        this.supportsHingeAngle = false;
         this.broadcastConfig();
       });
     });
@@ -354,6 +375,7 @@ export class DeviceSession {
     this.screenRefreshTimer = undefined;
     void this.unsubscribeScreenChanges?.().catch(() => {});
     this.unsubscribeScreenChanges = undefined;
+    this.queueInputCleanup(this.serverInput, true);
     for (const ws of this.admittedHidSockets) {
       this.discardQueuedInput(ws);
       this.detachHidSocket(ws);
@@ -1100,7 +1122,10 @@ export class DeviceSession {
       if (isOrderedMessage) {
         this.inFlightOrderedMessages.set(ws, (this.inFlightOrderedMessages.get(ws) ?? 0) + 1);
       }
-      void this.handleHidMessage(buffer, ws)
+      const priorOrderedMessages = buffer[0] === 0x11
+        ? [...(this.pendingOrderedMessages.get(ws) ?? [])]
+        : undefined;
+      const operation = this.handleHidMessage(buffer, ws, priorOrderedMessages)
         .catch(() => {
           if (isOrderedMessage) this.failedInputSockets.add(ws);
         })
@@ -1115,6 +1140,15 @@ export class DeviceSession {
           this.notifyInputStateChanged();
         })
         .catch(() => {});
+      if (isOrderedMessage) {
+        let pending = this.pendingOrderedMessages.get(ws);
+        if (!pending) {
+          pending = new Set();
+          this.pendingOrderedMessages.set(ws, pending);
+        }
+        pending.add(operation);
+        void operation.then(() => pending.delete(operation));
+      }
     });
     ws.on("close", () => this.detachHidSocket(ws));
     ws.on("error", () => this.detachHidSocket(ws));
@@ -1128,6 +1162,7 @@ export class DeviceSession {
     this.detachedHidSockets.add(ws);
     this.hidSockets.delete(ws);
     this.discardQueuedInput(ws);
+    this.queueInputCleanup(this.serverInput, true);
     if ((this.inFlightOrderedMessages.get(ws) ?? 0) === 0) this.finishDetachedHidSocket(ws);
     this.notifyInputStateChanged();
     if (this.hidSockets.size === 0) {
@@ -1136,7 +1171,7 @@ export class DeviceSession {
     }
   }
 
-  private async handleHidMessage(data: Buffer, ws: HidSocket): Promise<void> {
+  private async handleHidMessage(data: Buffer, ws: HidSocket, priorOrderedMessages?: Promise<void>[]): Promise<void> {
     if (data.length < 1) return;
     try {
       // Capture startup identifies the active display and configures HID's
@@ -1243,21 +1278,25 @@ export class DeviceSession {
         const operation = this.hingeControlUpdate.then(async () => {
           const value = ORIENTATION_BY_NAME[m.orientation];
           if (this.phase !== "running" || value == null || !await this.hid.orientation(value)) return;
-          this.supportsHingeAngle ??= await this.hid.supportsHingeAngle();
+          this.hingeRotated = true;
+          // Only startup hydration advertises hinge support, after it reads the angle.
+          const supportsHingeAngle = this.supportsHingeAngle ?? await this.hid.supportsHingeAngle();
           if (this.phase !== "running") return;
           this.recordHidEvent(tag, m);
-          if (this.supportsHingeAngle) {
+          if (supportsHingeAngle) {
             // Rotation is panel-relative; only a named pose establishes the
             // physical orientation needed to determine Table Mode eligibility.
             this.hingePose = null;
             this.hingePhysicalOrientation = undefined;
             this.tableMode = false;
+            this.saveHingeState();
             // Apps may lock their interface. Keep native readback authoritative.
             await this.refreshScreenSizeFromNative();
             this.broadcastConfig();
           } else {
             // @ref LLP 0003#rotation-readback — regular-device framing survives portrait-only apps
             this.requestedOrientation = m.orientation;
+            writeSavedHingeState(this.udid, {});
             if (m.orientation !== this.orientation) {
               this.orientation = m.orientation;
               this.broadcastConfig();
@@ -1389,22 +1428,109 @@ export class DeviceSession {
         break;
       }
       case 0x11: {
-        while (this.phase === "running" && this.hidSockets.has(ws) &&
-          (this.inFlightOrderedMessages.get(ws) ?? 0) > 0) {
-          await this.waitForInputStateChange();
-        }
+        const requestId = data.length === 1 ? undefined : json<{ requestId?: unknown }>()?.requestId;
+        if (data.length !== 1 && (typeof requestId !== "number" || !Number.isSafeInteger(requestId) || requestId <= 0)) break;
+        // Snapshot only input received before this barrier. Newer keys may keep arriving
+        // while it waits, but must not postpone the acknowledgment forever.
+        await Promise.all(priorOrderedMessages ?? []);
         if (this.phase === "running" && this.hidSockets.has(ws)) {
-          ws.send(Buffer.from([0x91, this.failedInputSockets.has(ws) || this.hid.inputUnavailable ? 0 : 1]));
+          const ok = !this.failedInputSockets.has(ws) && !this.hid.inputUnavailable;
+          ws.send(requestId === undefined
+            ? Buffer.from([0x91, ok ? 1 : 0])
+            : Buffer.concat([Buffer.from([0x91]), Buffer.from(JSON.stringify({ requestId, ok }))]));
+        }
+        break;
+      }
+      case 0x12: {
+        // The browser refuses larger requests itself; don't parse one from a direct client.
+        const m = data.length - 1 > EXEC_WS_MAX_MESSAGE_BYTES ? null : json<{ requestId: unknown; text: unknown }>();
+        const requestId = m?.requestId;
+        let ok = false;
+        let cleanupWarning: string | null = null;
+        let pasteError = "Could not paste into the simulator";
+        if (m && typeof requestId === "number" && Number.isSafeInteger(requestId) && requestId > 0 &&
+          (m.text === undefined || (typeof m.text === "string" && Buffer.byteLength(m.text, "utf8") <= MAX_PASTEBOARD_TEXT_BYTES))) {
+          const text = m.text;
+          // @ref LLP 0010#paste — Paste takes its turn in the input queue every viewer shares when it
+          // arrives, then holds the pasteboard lock through the write and the chord, so it stays in
+          // order with earlier and later input. Paste is not an ordered message, so a viewer that
+          // leaves while it waits does not hold up input cleanup.
+          const assertViewer = () => {
+            // A viewer that left while its write waited does not get its chord.
+            if (!this.hidSockets.has(ws) || this.detachedHidSockets.has(ws)) {
+              throw new Error("Clipboard viewer disconnected");
+            }
+          };
+          const sendShortcut = async () => {
+            assertViewer();
+            cleanupWarning = await this.sendPasteShortcut(ws);
+          };
+          try {
+            if (this.hid.inputUnavailable) throw new Error("Simulator input is unavailable");
+            const operation = this.queueInputOperation(ws, async () => {
+              if (this.hid.inputUnavailable) throw new Error("Simulator input is unavailable");
+              if (typeof text === "string") await pasteTextIntoSim(this.udid, text, sendShortcut, assertViewer);
+              else await withSimPasteboardLock(this.udid, sendShortcut, INPUT_PASTEBOARD_LOCK_TIMEOUT_MS);
+            }, { clipboard: true });
+            if (!operation) throw new Error("Clipboard viewer disconnected");
+            await operation;
+            ok = true;
+          } catch (error) {
+            if (error instanceof PasteboardBusyError) pasteError = error.message;
+            console.error(`[serve-sim] Could not paste into simulator ${this.udid}:`, error);
+          }
+        }
+        if (this.hidSockets.has(ws)) {
+          const reply = ok
+            ? { requestId, ok, ...(cleanupWarning ? { cleanupWarning } : {}) }
+            : { requestId, ok, error: pasteError };
+          try { ws.send(Buffer.concat([Buffer.from([0x92]), Buffer.from(JSON.stringify(reply))])); }
+          catch {}
         }
         break;
       }
     }
   }
 
+  /** Seed the hinge from native before advertising it, so clients never see support without state. */
+  private hydrateHingeState(): void {
+    const operation = this.hingeControlUpdate.then(async () => {
+      if (!this.hingeControlled || this.hingeAngle === undefined) {
+        const state = await this.hid.hingeState();
+        if (this.phase !== "running") return;
+        if (this.hingeControlled) {
+          this.hingeAngle = state.hingeAngle;
+          this.saveHingeState();
+        } else {
+          this.applyNativeHingeState(state);
+        }
+      }
+      this.supportsHingeAngle = true;
+      this.broadcastConfig();
+    });
+    this.hingeControlUpdate = operation.catch(() => {});
+  }
+
+  private applyNativeHingeState(state: NativeHingeState): void {
+    const saved = this.hingeRotated ? null : readSavedHingeState(this.udid, state.hingeAngle);
+    this.hingeAngle = state.hingeAngle;
+    this.tableMode = this.hingeRotated ? false : state.tableMode ?? saved?.tableMode;
+    this.hingePhysicalOrientation = this.hingeRotated ? undefined : state.physicalOrientation ?? saved?.physicalOrientation;
+    this.hingePose = this.hingeRotated ? null : saved?.hingePose ?? null;
+    if (this.hingeRotated) this.saveHingeState();
+  }
+
   /** Keep pose sequences ordered across sliders, presets, and legacy CLI clients. */
   private queueHingeControl(command: HingeControlCommand): Promise<boolean> {
     const operation = this.hingeControlUpdate.then(async () => {
       if (this.phase !== "running") return false;
+      if (!this.hingeControlled && this.hingeAngle === undefined) {
+        // Seed before the first save so an early command keeps the saved
+        // orientation, even when the command fails.
+        const state = await this.hid.hingeState();
+        if (this.phase !== "running") return false;
+        this.applyNativeHingeState(state);
+      }
       if (command.control === "table" && command.value && !isTableModeAvailable(this.hingeAngle, this.hingePhysicalOrientation)) return false;
       if (command.control === "physical" && this.supportsPhysicalOrientation === false) return false;
       if (command.control === "physical" && command.value === "facedown") {
@@ -1417,6 +1543,7 @@ export class DeviceSession {
         }
         if (!(this.hingeAngle !== undefined && this.hingeAngle > 0 && this.hingeAngle < 180)) return false;
       }
+      this.hingeControlled = true;
       const ok = command.control === "pose" ? await this.hid.setHingePose(command.value)
         : command.control === "physical" ? await this.hid.setPhysicalOrientation(command.value)
         : command.control === "table" ? await this.hid.setTableMode(command.value)
@@ -1429,6 +1556,7 @@ export class DeviceSession {
         if (state.tableMode !== undefined) this.tableMode = state.tableMode;
         if (command.control === "physical") this.hingePhysicalOrientation = command.value;
         if (command.control === "pose") this.hingePhysicalOrientation = hingePoseOrientation(command.value);
+        this.saveHingeState();
         this.broadcastConfig();
       } else {
         // A failed sequence can still move the hinge or change the active
@@ -1439,6 +1567,12 @@ export class DeviceSession {
         this.hingeAngle = recovered.hingeAngle ?? this.hingeAngle;
         this.tableMode = recovered.tableMode;
         this.hingePhysicalOrientation = recovered.physicalOrientation ?? this.hingePhysicalOrientation;
+        writeSavedHingeState(this.udid, {
+          hingeAngle: recovered.hingeAngle,
+          hingePose: null,
+          physicalOrientation: this.hingePhysicalOrientation,
+          tableMode: this.tableMode,
+        });
         try { await this.refreshScreenSizeFromNative(); }
         catch { /* Preserve the last readable screen through a transient failure. */ }
         if (this.phase !== "running") return false;
@@ -1448,6 +1582,15 @@ export class DeviceSession {
     });
     this.hingeControlUpdate = operation.then(() => {}, () => {});
     return operation;
+  }
+
+  private saveHingeState(): void {
+    writeSavedHingeState(this.udid, {
+      hingeAngle: this.hingeAngle,
+      hingePose: this.hingePose,
+      physicalOrientation: this.hingePhysicalOrientation,
+      tableMode: this.tableMode,
+    });
   }
 
   private queueSoftwareKeyboardSync(visible: boolean): void {
@@ -1466,38 +1609,138 @@ export class DeviceSession {
     return axTypeKeyboardCharacterAsync(this.udid, character).catch(() => false);
   }
 
-  private async updateHidKey(ws: HidSocket, type: "down" | "up", usage: number): Promise<void> {
+  /** Press Command+V for one viewer's paste; see `sendCommandShortcut`. */
+  private sendPasteShortcut(ws: HidSocket): Promise<string | null> {
+    return this.sendCommandShortcut(KEY_V, ws);
+  }
+
+  // Like Paste, take the input turn before the pasteboard lock, and hold both through the read.
+  async copyPasteboard(): Promise<PasteboardReadResult> {
+    // Capture startup configures HID's target, as for viewer input.
+    await this.waitForCapture();
+    if (this.hid.inputUnavailable) throw new Error("Simulator input is unavailable");
+    let cleanupWarning: string | null = null;
+    let copied: PasteboardReadResult;
+    try {
+      copied = await copyFromSim(this.udid, async () => {
+        cleanupWarning = await this.sendCommandShortcut(KEY_C, null);
+      }, async (copy) => {
+        let text: string | undefined;
+        const turn = this.queueInputOperation(this.serverInput, async () => {
+          // The session can stop while Copy waits for the lock or its turn.
+          if (this.phase !== "running" || this.hid.inputUnavailable) throw new Error("Simulator input is unavailable");
+          text = await copy();
+        }, { clipboard: true });
+        if (!turn) throw new Error("Simulator input is unavailable");
+        await turn;
+        if (text === undefined) throw new Error("Simulator input is unavailable");
+        return text;
+      });
+    } catch (error) {
+      // A chord can leave Command held and still fail its change wait or read; report both.
+      throw withCleanupWarning(error, cleanupWarning);
+    }
+    return cleanupWarning ? { ...copied, cleanupWarning } : copied;
+  }
+
+  // Lift held Control, Shift, and Option, whichever viewer holds them, without changing ownership,
+  // then restore them. A held Command serves the chord. Keep a held shortcut key lifted after a
+  // successful chord so restoring it does not type the letter again. The server's own chord keys
+  // are tracked so disconnect cleanup can release them.
+  private async sendCommandShortcut(shortcutKey: typeof KEY_C | typeof KEY_V, ws: HidSocket | null): Promise<string | null> {
+    if (this.phase !== "running") throw new Error("Simulator input is unavailable");
+    if (ws && !this.hidSockets.has(ws)) throw new Error("Clipboard viewer disconnected");
+    await this.releaseHidKeys(this.serverInput, true);
+    const owner = ws ?? this.serverInput;
+    const pressedAtSimulator = new Set(this.activeHidKeyUsageCounts.keys());
+    const shortcutKeyHeld = pressedAtSimulator.has(shortcutKey);
+    const liftedModifiers = new Set<number>();
+    const unownedKeysDown = new Set<number>();
+    const ownedKeysDown = new Set<number>();
+    let shortcutKeyReleased = false;
+    let cleanupFailed = false;
+    let liftedShortcutKey = false;
+    let shortcutKeyPressed = false;
+    try {
+      if (shortcutKeyHeld) {
+        await this.hid.keyChecked("up", shortcutKey);
+        liftedShortcutKey = true;
+      }
+      for (const event of simCommandShortcutHidEvents(pressedAtSimulator, shortcutKey)) {
+        if (event.type === "up") await new Promise((resolve) => setTimeout(resolve, 30));
+        if (!shortcutKeyReleased && (this.phase !== "running" || this.hid.inputUnavailable)) throw new Error("Simulator input is unavailable");
+        try {
+          if (isLiftedModifier(event.usage)) {
+            await this.hid.keyChecked(event.type, event.usage);
+            if (event.type === "up") liftedModifiers.add(event.usage);
+            else liftedModifiers.delete(event.usage);
+          } else if (shortcutKeyHeld && event.usage === shortcutKey) {
+            await this.hid.keyChecked(event.type, event.usage);
+            shortcutKeyPressed = event.type === "down";
+            if (!ws && event.type === "down") unownedKeysDown.add(event.usage);
+            else unownedKeysDown.delete(event.usage);
+          } else {
+            await this.updateHidKey(owner, event.type, event.usage, true);
+            if (event.type === "down") ownedKeysDown.add(event.usage);
+            else ownedKeysDown.delete(event.usage);
+          }
+        } catch (error) {
+          // The shortcut key was released, so the app may have acted already. Retry cleanup
+          // below and report any remaining held key separately from the shortcut result.
+          if (!shortcutKeyReleased) throw error;
+        }
+        if (event.type === "up" && event.usage === shortcutKey) shortcutKeyReleased = true;
+      }
+    } finally {
+      // A failed chord must not leave its own keys down or another viewer's modifier up.
+      for (const usage of unownedKeysDown) await this.hid.keyChecked("up", usage).catch(() => { cleanupFailed = true; });
+      for (const usage of ownedKeysDown) await this.updateHidKey(owner, "up", usage, true).catch(() => { cleanupFailed = true; });
+      for (const usage of liftedModifiers) await this.hid.keyChecked("down", usage).catch(() => { cleanupFailed = true; });
+      if (liftedShortcutKey && !shortcutKeyReleased && !shortcutKeyPressed) {
+        await this.hid.keyChecked("down", shortcutKey).catch(() => { cleanupFailed = true; });
+      }
+    }
+    return cleanupFailed || this.activeHidKeyUsages.get(this.serverInput)?.size
+      ? "A simulator key may still be held. Release it or reconnect input."
+      : null;
+  }
+
+  private async updateHidKey(ws: HidSocket, type: "down" | "up", usage: number, checked = false): Promise<void> {
     const socketUsages = this.activeHidKeyUsages.get(ws);
     if (!socketUsages) return;
+    const key = (phase: "down" | "up") => checked ? this.hid.keyChecked(phase, usage) : this.hid.key(phase, usage);
     const owners = this.activeHidKeyUsageCounts.get(usage) ?? 0;
     if (type === "down") {
       if (socketUsages.has(usage)) {
-        await this.hid.key("down", usage);
+        await key("down");
         return;
       }
-      if (owners === 0) await this.hid.key("down", usage);
+      if (owners === 0) await key("down");
       socketUsages.add(usage);
       this.activeHidKeyUsageCounts.set(usage, owners + 1);
       return;
     }
-    if (!socketUsages.delete(usage)) return;
+    if (!socketUsages.has(usage)) return;
     if (owners <= 1) {
+      await key("up");
       this.activeHidKeyUsageCounts.delete(usage);
-      await this.hid.key("up", usage);
     } else {
       this.activeHidKeyUsageCounts.set(usage, owners - 1);
     }
+    socketUsages.delete(usage);
   }
 
-  private queueInputOperation(ws: HidSocket, run: () => Promise<void>): Promise<void> | null {
+  private queueInputOperation(ws: HidSocket, run: () => Promise<void>, options: { clipboard?: boolean } = {}): Promise<void> | null {
     if (this.phase !== "running" || this.detachedHidSockets.has(ws) || this.overloadedHidSockets.has(ws)) return null;
     const queue = this.inputOperationQueues.get(ws) ?? [];
     if (queue.length >= MAX_PENDING_INPUT_OPERATIONS_PER_SOCKET) {
-      this.overloadHidSocket(ws);
+      if (ws !== this.serverInput) this.overloadHidSocket(ws);
       return null;
     }
+    const sequence = ++this.inputOperationSequence;
+    if (options.clipboard) this.clipboardInputBarriers.add(sequence);
     const result = new Promise<void>((resolve, reject) => {
-      queue.push({ run, resolve, reject });
+      queue.push({ sequence, run, resolve, reject });
     });
     this.inputOperationQueues.set(ws, queue);
     this.scheduleInputSocket(ws);
@@ -1514,13 +1757,18 @@ export class DeviceSession {
 
   private discardQueuedInput(ws: HidSocket): void {
     const queue = this.inputOperationQueues.get(ws) ?? [];
-    for (const operation of queue.splice(0)) operation.resolve();
+    for (const operation of queue.splice(0)) {
+      this.clipboardInputBarriers.delete(operation.sequence);
+      operation.resolve();
+    }
     this.inputOperationQueues.set(ws, queue);
   }
 
   private queueInputCleanup(ws: HidSocket, priority = false): void {
     const queue = this.inputOperationQueues.get(ws) ?? [];
-    queue.push({
+    const operation: InputOperation = {
+      sequence: ++this.inputOperationSequence,
+      priorityCleanup: priority,
       run: async () => {
         if (this.scrollOwner === ws) {
           await this.hid.cancelScroll();
@@ -1531,12 +1779,7 @@ export class DeviceSession {
           touches.delete(ws);
           await release?.().catch(() => {});
         }
-        const activeHidKeyUsages = this.activeHidKeyUsages.get(ws);
-        if (activeHidKeyUsages) {
-          for (const usage of activeHidKeyUsages) {
-            await this.updateHidKey(ws, "up", usage).catch(() => {});
-          }
-        }
+        await this.releaseHidKeys(ws, ws === this.serverInput);
         this.axHandledKeyUsages.get(ws)?.clear();
         if (!this.hidSockets.has(ws) && (this.inFlightOrderedMessages.get(ws) ?? 0) === 0) {
           this.admittedHidSockets.delete(ws);
@@ -1544,9 +1787,17 @@ export class DeviceSession {
       },
       resolve: () => {},
       reject: () => {},
-    });
+    };
+    if (priority) queue.unshift(operation);
+    else queue.push(operation);
     this.inputOperationQueues.set(ws, queue);
     this.scheduleInputSocket(ws, priority);
+  }
+
+  private async releaseHidKeys(ws: HidSocket, checked = false): Promise<void> {
+    for (const usage of this.activeHidKeyUsages.get(ws) ?? []) {
+      await this.updateHidKey(ws, "up", usage, checked).catch(() => {});
+    }
   }
 
   private finishDetachedHidSocket(ws: HidSocket): void {
@@ -1598,6 +1849,17 @@ export class DeviceSession {
             await this.waitForInputStateChange();
             continue;
           }
+        } else {
+          const barrier = this.clipboardInputBarriers.values().next().value;
+          if (barrier !== undefined) {
+            // @ref LLP 0010#paste — round-robin input may not overtake a clipboard barrier.
+            index = this.inputSocketOrder.findIndex((socket) => {
+              const next = this.inputOperationQueues.get(socket)?.[0];
+              return next && (next.priorityCleanup || next.sequence < barrier);
+            });
+            if (index < 0) index = this.inputSocketOrder.findIndex((socket) =>
+              this.inputOperationQueues.get(socket)?.[0]?.sequence === barrier);
+          }
         }
         const ws = this.inputSocketOrder.splice(index, 1)[0]!;
         const queue = this.inputOperationQueues.get(ws);
@@ -1612,6 +1874,8 @@ export class DeviceSession {
           operation.resolve();
         } catch (error) {
           operation.reject(error);
+        } finally {
+          this.clipboardInputBarriers.delete(operation.sequence);
         }
         if (queue.length > 0) {
           this.inputSocketOrder.push(ws);

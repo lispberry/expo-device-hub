@@ -5,7 +5,7 @@
 **Systems:** ServeSim, HubClient
 **Author:** Gabe Debes
 **Date:** 2026-09-23
-**Revised:** 2026-10-09 (rotation readback contract)
+**Revised:** 2026-10-12 (rotation readback contract; added installed-app launch, control, data-file and upload actions)
 **Related:** LLP 0001, LLP 0002
 
 > File paths such as `src/…` are relative to `packages/serve-sim/packages/serve-sim`, unless the text gives a path from the repository root.
@@ -25,6 +25,7 @@ server's selected device.
 | `/api` | Current device and stream state, including `execToken`. |
 | `/api/screenshot` | `POST`. A still PNG. |
 | `/api/apps/icon?bundleId=<id>` | An installed app's icon, `{ok, bundleId, icon: {mimeType, data} \| null}`, the same shape as serve-emu's route, with `bundleId` in place of `packageName`. `icon` is null when the app has its icon only in `Assets.car`. 404 when the app is not installed, 503 when `simctl` cannot answer (retry). |
+| `/api/pasteboard` | `POST` reads the simulator pasteboard as `{ok, text}`; `?copy=1` presses Command+C first; `PUT` with `{"text": …}` writes it. See [Pasteboard](#pasteboard). |
 | `/helper/<udid>/recording/video` | `GET` reports whether a recording is active; `POST` starts, `PUT` renews, and `DELETE` finalizes a native-size H.264 recording. Mutations require a recording ID; when `--require-token` is set, they also require its bearer token. |
 | `/api/events`, `/api/event-log`, `/api/event-log/events` | Device events and the recorded log. |
 | `/metrics` | CPU, memory and network samples, one per second. |
@@ -58,6 +59,43 @@ recording; an existing `recording.mp4` or `session.json` is preserved. A
 `DELETE` that arrives before its `POST` cancels that recording ID for two
 minutes. Repeating `DELETE` during or after finalization returns the same
 result until another recording starts.
+
+## Pasteboard
+
+`POST /api/pasteboard` reads the simulator pasteboard; `PUT /api/pasteboard` with
+`{"text": "…"}` writes it. Besides the token, both need a browser `Origin`: the
+preview's own origin or one that the CORS policy allows. A request without an
+`Origin` gets 403. Text over 4 MiB, in either direction, returns 413. A read
+that neither `simctl pbpaste` nor the app reader can answer returns 503 with a
+message that says what to do next. The `PUT` body can be up to 8 MiB, to leave
+room for JSON escaping. Responses are not cached.
+[LLP 0010](0010-serve-sim-clipboard.explainer.md) explains the design.
+
+When `simctl pbpaste` fails, a read can ask the app reader. Before it asks, it
+grants the target app pasteboard access with `simctl privacy`. A read that
+fails after the grant also leaves it. serve-sim never undoes the grant. It is
+stored in the simulator's privacy (TCC) database. On an iOS 26.4 simulator, it
+stayed after a reboot. It also replaced a Deny that `simctl privacy revoke`
+stored. While it stayed, the app got no "Allow Paste" prompt.
+`xcrun simctl privacy <udid> reset pasteboard <bundle-id>` returns the app to
+the prompt. A later read through the app reader grants access again. Do not
+use `revoke`. On that simulator, it stored a Deny, and pasteboard reads in the
+app then got empty text with no prompt. `--disable clipboard`, or
+`clipboard: false` for `simMiddleware`, prevents the grant.
+[LLP 0010](0010-serve-sim-clipboard.explainer.md#the-pasteboard-grant-stays)
+gives the details.
+
+`POST /api/pasteboard?copy=1` is Copy: the server presses Command+C in the
+device's input queue, waits for the pasteboard to change, and returns the copied
+text. It returns 504 when the app does not change the pasteboard within 5 s, and
+409 when the device has no input session or another process holds the pasteboard
+lock for more than one second. A lock conflict says "Simulator clipboard is busy.
+Try again." Copy checks and installs `ServeSimPasteboard.app` under that same lock
+(`com.expo.serve-sim-pasteboard`) on the simulator when it is missing or
+differs from the copy that serve-sim ships. Each Copy grants it pasteboard
+access. The app and the grant stay after Copy, and the app shows on the Home
+screen. `--disable clipboard`, or `clipboard: false` for `simMiddleware`, does
+not prevent this.
 
 ## Authentication
 
@@ -189,22 +227,37 @@ policy beyond that.
 
 ## WebSockets
 
-All of these are gated by the token, but not identically. `/exec-ws` also checks
-the `Origin` a browser sends: it accepts the preview's own origin and any origin
-named by `--cors-origin`, and closes anything else even with a valid token.
-Loopback is not implicit here. The HID and CDP sockets check the token only, so
-any origin holding it can drive them; `frame-ancestors` does not constrain a
-WebSocket.
+With `--require-token`, all of these need the token, but not identically.
+`/exec-ws` also checks the `Origin` a browser sends: it accepts the preview's
+own origin and any origin named by `--cors-origin`, and closes anything else
+even with a valid token. Loopback is not implicit here. The HID and CDP sockets
+do not check the `Origin` for a bearer token or a token subprotocol, so any
+origin holding the token can drive them. The access cookie passes only on a
+same-origin request. `frame-ancestors` does not constrain a WebSocket.
+
+Without `--require-token`, the HID and CDP sockets need neither the token nor an
+allowed `Origin`. Only the `Host` check in [Allowed hosts](#allowed-hosts)
+applies. `/exec-ws` still checks the `Origin` and needs the token.
 
 | Path | Purpose |
 | --- | --- |
-| `{helper}/ws` | HID input. Pointer and key events to the device. |
+| `{helper}/ws` | HID input. Pointer and key events, and Paste, to the device. |
 | `/exec-ws` | Scoped simulator actions. Request and response frames. |
 | `/devtools/page/{targetId}` | CDP bridge to an inspectable WebKit target. |
 
 `{helper}` is the helper proxy prefix under the mount point. The target ids for
 the DevTools bridge come from `GET /devtools`, which returns a
 `webSocketDebuggerUrl` per target.
+
+### CLI input admission
+
+Helpers advertise `inputAdmission: true` in their state record and send the
+single-byte `0x83` frame after reserving an input slot. The CLI's short input
+commands wait for that frame before sending. A full pool closes with `1013`,
+which fails the command even if the refusal arrives after the transport opens.
+A connection that never admits input fails after ten seconds. Older helpers
+without the state flag retain their open-based behavior [observed:
+`src/socket/cli-input.ts`, `src/index.ts`, `src/state.ts`].
 
 The CDP bridge forwards frames verbatim in both directions. The token
 subprotocol is not forwarded upstream, so the credential stops at serve-sim.
@@ -266,3 +319,77 @@ and its socket `close` listener]. The close-delivery tests cover immediate
 capacity release, idempotent close, discarded input, cleanup of an unresponsive
 peer, and receipt of the 1013 refusal code/reason over a real Node socket with
 concurrent input [observed: `src/__tests__/raw-hid-socket.test.ts`].
+
+### Launching an installed app
+
+An authenticated `/exec-ws` client can launch an installed app with
+`{id, action: "app.launch", params: {udid, bundleId, launchArgs?, openUrl?}}`.
+Use a Simulator UDID. The action restarts the app with the supplied arguments,
+preserves the session's active capabilities, then pre-approves and opens the
+optional deep link. Pre-approval is best effort. Launch arguments are limited
+to 256 arguments of 8,192 characters each and 128 KiB total UTF-8 bytes,
+including terminators. The action replies with
+`{id, stdout, stderr, exitCode}`; invalid parameters and unsupported actions
+reply with `{id, error}`. Installation stays a separate operation. Setup finishes
+before the app stops. If the stop or the launch fails, the action restores the
+previous app target, launch settings, and capability environment. The deep link
+opens after the app is running, so a failed `openUrl` keeps the new launch.
+
+### App controls
+
+- `app.stop`: `{udid, bundleId}`. Terminates the app; returns an error if it
+  cannot be terminated, including when it is already stopped.
+- `app.openUrl`: `{udid, bundleId, url}`. Opens a deep link with best-effort
+  custom-scheme pre-approval, without first restarting the app. To launch and open
+  a link together, use `app.launch` with `openUrl`. URLs are limited to 8,192
+  characters and cannot contain NUL.
+
+Both actions require a specific Simulator UDID and use the authenticated
+`/exec-ws` channel.
+
+### App data files
+
+- `app.container`: `{udid, bundleId, type?: "app" | "data"}`. Returns the
+  container path. The default remains `"app"`; select `"data"` for writable app storage.
+- `app.file.list`: `{udid, bundleId, relativePath?}`. Returns a JSON array of
+  entry names and types. Omit the path for the container root. Limited to 1000 entries.
+- `app.file.read`: `{udid, bundleId, relativePath}`. Returns file bytes as base64,
+  limited to 10 MiB per regular file.
+- `app.file.remove`: `{udid, bundleId, relativePath}`. Deletes one regular file,
+  never a directory.
+
+These API actions use the authenticated `/exec-ws` channel and require a specific
+Simulator UDID. Paths are relative to the selected app's **data** container;
+traversal and symlinks encountered during path checks, including in the container
+root or its ancestors, are refused. Keep the app
+stopped and prevent other tools from changing its directories during an operation.
+Requests are serialized with app controls on the same device; another device can
+proceed independently. The preview UI has no storage editor. These actions are
+currently iOS Simulator only; serve-emu does not expose equivalent file actions.
+Android parity remains outside this serve-sim rollout.
+
+### Uploading an app fixture
+
+`app.file.upload`: `{udid, bundleId, uploadId, relativePath, overwrite?}` copies a
+completed staged upload into the app's data container, creating parent directories.
+It returns JSON with `relativePath` and the copied byte count. Writes are atomic
+and refuse existing files unless `overwrite: true`. Files are limited to 10 MiB;
+staged uploads remain available until `upload.remove` or staging cleanup.
+Within a server, staging resets, pruning and removals wait while a copy reads its
+source bytes. Each server process stages uploads in its own folder, so an upload ID
+names only uploads sent to that server. Send `upload.append` and `app.file.upload`
+to the same server. The staging size limit counts the folders of all servers; two
+servers that upload at the same time can each pass it by one chunk. Each
+upload chunk removes the folders of servers that exited, and uploads older than six
+hours in any folder. A copy that already opened its source still reads all of it.
+
+Send requests sequentially: `app.stop` → `upload.append` → `app.file.upload` →
+`app.launch`, then `upload.remove` when the staged source is no longer needed.
+Finish all chunks before copying, and keep the app stopped until all related
+files are in place. Atomicity applies to each file, not a multi-file transaction.
+
+For example, seed `Documents/session.json` or an app-compatible SQLite database.
+The app must understand the format. For SQLite, stop the app and use a consistent
+checkpointed snapshot, or restore the matching database and WAL files together.
+These actions copy bytes; they do not translate JSON into AsyncStorage, import
+Keychain entries, create backend sessions, or execute uploaded JavaScript.
