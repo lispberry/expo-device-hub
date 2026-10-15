@@ -36,15 +36,23 @@ import { SERVER_PLATFORM_FILTER } from './platform-filter';
 import {
   EMU_PREFIX,
   EMU_TOKEN_SUBPROTOCOL_PREFIX,
+  emuAllowsOrigin,
   emuCameraFeeds,
   emuWebSocketHandler,
   handleEmuRequest,
   finishAndroidScreenRecording,
 } from './serve-emu';
-import { SIM_PREFIX, SIM_TOKEN_SUBPROTOCOL_PREFIX, handleSimRequest, simWebSocketHandler } from './serve-sim';
+import {
+  SIM_PREFIX,
+  SIM_TOKEN_SUBPROTOCOL_PREFIX,
+  handleSimRequest,
+  simAllowsOrigin,
+  simWebSocketHandler,
+} from './serve-sim';
 import {
   authorizeRequest,
   authorizeUpgrade,
+  corsHeadersFor,
   frameAncestorsPolicy,
   withBearerToken,
 } from './session-auth';
@@ -143,19 +151,30 @@ function isSimRecordingControl(pathname: string): boolean {
 }
 
 /**
+ * A backend's refusal carries its CORS headers, so a page that may read the backend can read why
+ * the token was refused, not only a network error. The Hub's own routes allow no other origin.
+ */
+function refusalCorsHeaders(request: Request, pathname: string): Record<string, string> {
+  if (isSimPath(pathname)) return corsHeadersFor(request, simAllowsOrigin);
+  if (isEmuPath(pathname)) return corsHeadersFor(request, emuAllowsOrigin);
+  return {};
+}
+
+/**
  * The response that refuses a request, or the request to route. An authorized request carries
  * the token as a bearer, because the vendored backends' own gates never see the Hub's cookie.
  * Recording control keeps the credential it came with.
  */
 function gateRequest(request: Request, pathname: string): Request | Response {
   if (!SESSION_TOKEN || UNGATED_ROUTES.has(pathname)) return request;
-  // A preflight cannot carry the token. Each backend answers or refuses one in its own gate, and
-  // routes none: serve-sim answers every preflight, serve-emu only its WebRTC ones.
+  // A preflight cannot carry the token. Each backend answers or refuses every preflight in its own
+  // gate, and routes none.
   if (request.method === 'OPTIONS' && (isSimPath(pathname) || isEmuPath(pathname))) return request;
   const refused = authorizeRequest(request, SESSION_TOKEN, {
     mountPath: MOUNT_PATH,
     htmlHeaders: FRAME_POLICY_HEADERS,
     allowQueryToken: !pathname.startsWith(SIM_CAPTURE_PREFIX),
+    corsHeaders: refusalCorsHeaders(request, pathname),
   });
   if (refused) return refused;
   return isSimRecordingControl(pathname) ? request : withBearerToken(request, SESSION_TOKEN);
